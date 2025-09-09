@@ -15,11 +15,12 @@ This repository targets large simulation outputs (up to millions of atoms) and i
 ## Features
 
 - **Step 0 – SOAP**: Generate per-atom SOAP descriptors from trajectory/structure files.
-- **Step 1 – AE training**: Train an autoencoder on descriptors; save model + latent representations + reconstruction errors.
-- **Step 2 – Defect detection**: Identify outliers/defects from AE outputs; write filtered `.npy` sets and optional `.xyz`.
+- **Step 1 – AE training**: Train an autoencoder on descriptors; save **standard scaler**, **model checkpoint**, **loss logs**, **training plot**, and **hyperparameter record**.
+- **Step 2 – Defect detection**: Identify outliers/defects from AE **reconstruction errors**; write filtered `.npy` sets and optional `.xyz`.
 - **Step 2bis – Merge**: Batch-merge many per-run `.npy` files into consolidated arrays.
 - **Step 3 – UMAP + HDBSCAN**: Embed and cluster defective atoms; save embeddings, labels, and plots.
 - **Step 4 – XYZ export**: Write XYZ files per cluster / group for visual analysis (e.g., OVITO, VMD).
+
 
 ---
 
@@ -65,33 +66,34 @@ python 0_Dscribe_SOAP_gen.py <filename>
 ## 1) Autoencoder training — `01_autoencoder_training.py`
 
 **Purpose**  
-Train a **PyTorch** Autoencoder (AE) on SOAP descriptors; export the model, latent codes, reconstruction errors, and a reproducibility log.
+Train a **PyTorch** Autoencoder (AE) on SOAP descriptors; perform (optional) **Optuna** hyperparameter search; save the fitted **standard scaler**, AE **model checkpoint**, **loss logs**, a **training plot**, and a **hyperparameter record**.
 
 **Inputs & Assumptions**
-- Descriptor files (`*.npy`) located in the training folder (e.g., `./run/data/dataset/AE_training/`).
-- AE architecture/hyperparameters configured in the script (layers, latent size, batch size, epochs, learning rate).
-- Random seeds are fixed for reproducibility.
+- Descriptor files (`*.npy`) located under: `./run/data/dataset/AE_training/`
+  - The script automatically picks the **first** `.npy` file it finds there.
+- No CLI flags: **edit parameters inside the script** (latent size, batch size, epochs, learning rate, etc.).
+- The script sets random seeds for reproducibility (`numpy`, `random`, `torch`).
 
 **What the script does**
-1. Loads descriptor arrays and builds `DataLoader`s for train/validation.
-2. Defines an AE: encoder → latent → decoder (fully connected).
-3. Trains with MSE reconstruction loss; logs/plots losses over epochs.
-4. After training:
-   - Saves **model weights/checkpoints**.
-   - Computes and saves **latent embeddings** for all samples.
-   - Computes and saves **reconstruction errors** (per sample).
-   - Writes `training/ae/hyperparameters.txt` with all key settings and paths.
+1. Locates the first descriptor file under `./run/data/dataset/AE_training/` and loads it.
+2. Splits the data into **train/val/test** (default ratios in the script).
+3. Runs an **Optuna** search (`run_optuna_search`) to suggest best hyperparameters  
+   *(latent ratio, batch size, learning rate, num epochs)*, **then trains** the AE with those settings.  
+   If you disable/comment the search, the script uses the **fallback defaults** defined inside it.
+4. Standardizes inputs with `StandardScaler` and saves the scaler.
+5. Trains the AE (MSE loss, Adam) and evaluates on the test set.
+6. Saves artifacts and a clean hyperparameter log.
 
-**Outputs**
-- `training/ae/checkpoints/*.pt` (or similar) — trained weights.
-- `training/ae/latent_*.npy` — latent space representation.
-- `training/ae/recon_error_*.npy` — per-sample reconstruction errors.
-- `training/ae/loss_curve.pdf` — training/validation loss figure.
-- `training/ae/hyperparameters.txt` — full run log (existing file is overwritten to avoid appends).
+**Outputs (paths are defined in the script)**
+- `./training/ae/standard_scaler.pkl` — fitted `StandardScaler` (joblib)
+- `./training/ae/autoencoder_model.pth` — serialized AE model (via `torch.save`)
+- `./training/ae/losses.csv` — per-epoch training/validation losses (CSV)
+- `./training/ae/training_errors.pdf` — loss curves (PDF)
+- `./training/ae/hyperparameters.txt` — run settings (input_dim, latent_dim, batch_size, num_epochs, lr, etc.)
 
-**Usage (example)**
+**Usage**
 ```bash
-python 01_autoencoder_training.py 
+python 01_autoencoder_training.py
 ```
 
 ## 2) Defect detection via AE errors — `02_defect_detection.py`
@@ -123,43 +125,60 @@ Identify **defective atoms** as **outliers** based on AE reconstruction error, a
 
 **Usage (example)**
 ```bash
-python 02_defect_detection.py \
-  --base_dir ./run/data/dataset \
-  --pattern "ni10cr20V_.*" \
-  --threshold 5.0
+# Single threshold (e.g., 5.0)
+python 02_defect_detection.py 5.0
+
+# Multiple thresholds at once
+python 02_defect_detection.py 0,1.5,3,5
 ```
 
 ## 2bis) Merge per-run arrays — `02bis_merge_npy.py`
 
 **Purpose**  
-Aggregate many per-run defect arrays into consolidated `full_data` sets **per Y** (a value parsed from filenames), and create **global** merges across runs.
+Aggregate many per-run defect outputs into consolidated `full_data` sets **per Y** (a value parsed from filenames like `detected_defects_AE_<Y>_desc.npy`), and also produce **global** merges across all runs.
 
 **Inputs & Assumptions**
-- A base dataset directory (e.g., `./run/data/dataset/`) containing many run subfolders.
-- In each run subfolder, `desc/detected_defects_AE_*_desc.npy` exist, with a name that encodes **Y**.
-- A `pattern`/`pattern_prefix` that identifies the run subfolders and lets the script extract `XXX` identifiers.
+- Base directory (default: `./run/data`) that contains a `dataset/` folder with multiple run subfolders.
+- In each run subfolder, the script expects files such as:
+  - `desc/detected_defects_AE_<Y>_desc.npy` (defect descriptors)
+  - `recon_err/detected_defects_AE_<Y>.npy` (indices + reconstruction errors)
+- The **Y** value is extracted from filenames (the integer after `AE_` and before `_desc.npy`).
+
+**Command-line Arguments**
+The script uses `argparse` with:
+- `--base_dir` (default: `./run/data`) → path containing the `dataset/` directory.
+- `--pattern` (**required**) → prefix identifying run directories to process  
+  *(e.g., `ni10cr20V_NiFeCr_stoller_100k_bx98_80kev_test1_rnd_` — the trailing run id is appended to this)*.
+- `--y` (optional, one or more integers) → **only** merge these Y values; if omitted, the script merges **all detected** Ys.
 
 **What the script does**
-1. For each run directory matching `--pattern`:
-   - Creates or **cleans** `full_data/`.
-   - Scans `desc/` to discover all available **Y** values (or use `--y` to select).
+1. Enumerates run directories under `./run/data/dataset/` whose names start with `--pattern`.
+2. For each such run directory:
+   - Creates or **cleans** a local `full_data/` folder to avoid mixing results.
+   - Discovers all available **Y** values from `desc/detected_defects_AE_<Y>_desc.npy`  
+     (or uses the list given via `--y`).
    - For each Y:
-     - Loads the matching **defect descriptors** and **recon errors**.
-     - Concatenates them and saves `full_data/XXX_Y_full_data.npy`.
-2. After all runs are processed:
-   - Builds **global merged** arrays per Y at the dataset level.
+     - Loads `desc/detected_defects_AE_<Y>_desc.npy` and `recon_err/detected_defects_AE_<Y>.npy`.
+     - Concatenates into a single array and saves `full_data/<RUNID>_<Y>_full_data.npy`.
+3. After all runs are processed, creates **global merged arrays** per Y at the dataset level.
 
 **Outputs**
-- Per run: `full_data/XXX_Y_full_data.npy`
-- Global (under dataset root): merged arrays for each Y across all runs.
+- Per run: `full_data/<RUNID>_<Y>_full_data.npy`
+- Global (under `./run/data/dataset/`): merged arrays per Y across all matching runs.
 
-**Usage (example)**
+**Usage**
 ```bash
+# Merge all available Y values for all runs matching the pattern
+python 02bis_merge_npy.py \
+  --base_dir ./run/data \
+  --pattern ni10cr20V_NiFeCr_stoller_100k_bx98_80kev_test1_rnd_
+
+# Merge only selected Y values (e.g., 10, 20, 40)
 python 02bis_merge_npy.py \
   --base_dir ./run/data \
   --pattern ni10cr20V_NiFeCr_stoller_100k_bx98_80kev_test1_rnd_ \
   --y 10 20 40
-  ```
+```
 
 ## 3) UMAP + HDBSCAN — `03_UMAP_HDBSCAN.py`
 
@@ -192,29 +211,37 @@ python 03_UMAP_HDBSCAN.py
 ## 4) Cluster-aware XYZ export & diagnostics — `04_xyz_gen_from_UMAP_HDBSCAN.py`
 
 **Purpose**  
-Map **UMAP/HDBSCAN** group assignments back to the original trajectories and export **cluster-specific XYZ** files. Produce per-cluster composition tables and diagnostic plots.
+Map **UMAP/HDBSCAN** cluster labels back to original trajectories and export **cluster-specific XYZ** files for visualization (OVITO/VMD). Also computes per-cluster composition tables and generates diagnostic plots (e.g., histograms/heatmaps of reconstruction errors or sizes).
 
 **Inputs & Assumptions**
-- Per-run subfolders containing:
-  - Original trajectories (`*.gz`).
-  - UMAP/HDBSCAN results (`umap_with_clusters.npy` or similar).
-- Indices saved during earlier steps let the script map clusters → atoms.
+- Per-run subfolders under your dataset root, each containing:
+  - Original trajectory (e.g., first `*.gz` or other OVITO-readable file).
+  - Results from step 3, e.g. `umap_with_clusters.npy` (embedding + labels).
+  - (Optionally) arrays with reconstruction errors or indices linking descriptors ↔ atoms.
+- Paths, cluster selections, and plotting toggles are **set inside the script** — there is **no CLI**.
 
 **What the script does**
-1. For each run and each cluster label:
-   - Gathers the corresponding atom indices.
-   - Writes **`cluster_<label>.xyz`** (or similar) under an export folder.
-2. Computes **per-cluster atom fractions** (per element/species) and saves tables.
-3. Generates **diagnostic plots** (e.g., log-scaled histograms/heatmaps of reconstruction errors).
+1. Iterates over run directories and loads:
+   - The UMAP/HDBSCAN outputs (labels per atom/sample).
+   - The corresponding trajectory (to reconstruct atomic subsets).
+2. For each **cluster label** found (including or excluding `-1` noise depending on your settings):
+   - Gathers atom indices mapped from your pipeline (descriptor/AE indices → atom IDs).
+   - Writes **cluster-specific XYZ** files (e.g., `exported_clusters/cluster_<label>.xyz`).
+3. Aggregates **per-cluster composition** (element/species percentages) and saves CSV/NPY tables.
+4. Generates **diagnostic figures** (PDF/PNG), e.g.:
+   - Cluster size distributions
+   - Log-scaled histograms / heatmaps of reconstruction error by cluster
+   - Bar plots of per-cluster composition
 
 **Outputs**
-- Per cluster per run: `exported_clusters/cluster_<id>.xyz`
-- CSV/NPY summaries of per-cluster composition.
-- Diagnostic PDFs (e.g., `atom_perc_cluster/*.pdf`).
+- `exported_clusters/cluster_<label>.xyz` per cluster per run
+- `atom_perc_cluster/*.csv` or `*.npy` with per-cluster composition summaries
+- Diagnostic plots (PDF/PNG) under `atom_perc_cluster/` or a run-specific figures directory
+- (Optional) a consolidated index → cluster mapping saved as `.npy` for reuse
 
-**Usage (example)**
+**Usage**
 ```bash
-python 04_xyz_gen_from_UMAP_HDBSCAN.py 
+python 04_xyz_gen_from_UMAP_HDBSCAN.py
 ```
 
 ## 🔗 End-to-end Workflow
@@ -230,73 +257,11 @@ python 04_xyz_gen_from_UMAP_HDBSCAN.py
 
 ## 📋 Requirements
 
-Python ≥ 3.9 is recommended.
+Python ≥ 3.8 is recommended.
 
-Core dependencies (based on the imports across scripts):
+Core dependencies:
 
 - **Numerics & Utils**: `numpy`, `pandas`, `joblib`, `glob`, `argparse`
-- **ML**: `torch` (PyTorch), `scikit-learn`, `umap-learn`, `hdbscan`
+- **ML**: `torch` (PyTorch), `scikit-learn`, `umap-learn`, `hdbscan`, `optuna`
 - **Descriptors & IO**: `dscribe`, `ase`, `ovito` (incl. `ovito.io.ase`)
 - **Plotting**: `matplotlib`, `seaborn`
-
-### Install (conda + pip example)
-
-```bash
-# Create env
-conda create -n ae_umap_hdbscan python=3.10 -y
-conda activate ae_umap_hdbscan
-
-# Core scientific stack
-pip install numpy pandas joblib scikit-learn matplotlib seaborn
-
-# ML
-pip install torch --index-url https://download.pytorch.org/whl/cpu   # or your CUDA build
-
-# Manifold + clustering
-pip install umap-learn hdbscan
-
-# Atomistic IO & descriptors
-pip install ase ovito dscribe
-```
-
----
-
-## 🚀 Quick Start
-
-### 0) Generate SOAP descriptors
-
-```bash
-python 0_Dscribe_SOAP_gen.py
-```
-
-### 1) Train the Autoencoder
-
-```bash
-python 01_autoencoder_training.py
-```
-
-### 2) Detect Defects / Outliers
-
-```bash
-python 02_defect_detection.py --base_dir /path/to/runs_root --pattern "ni10cr20V_.*" --threshold 5.0
-```
-
-### 2bis) Merge many `.npy` chunks
-
-```bash
-python 02bis_merge_npy.py --base_dir /path/to/runs_root --pattern_prefix "bx98_" --selected_ys 10 20 40
-```
-
-### 3) UMAP + HDBSCAN
-
-```bash
-python 03_UMAP_HDBSCAN.py
-```
-
-### 4) Export XYZ from UMAP/HDBSCAN Selections
-
-```bash
-python 04_xyz_gen_from_UMAP_HDBSCAN.py
-```
-
----
