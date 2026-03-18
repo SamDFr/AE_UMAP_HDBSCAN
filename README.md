@@ -10,6 +10,8 @@ Pipeline for **unsupervised defect detection and clustering** in atomistic simul
 
 This repository targets large simulation outputs (up to millions of atoms) and is organized as a step-by-step workflow from descriptor generation to cluster-aware structure extraction.
 
+The datasets of MD simulations is available at https://data.mendeley.com/datasets/x543g8r5sz/1
+
 ---
 
 ## Features
